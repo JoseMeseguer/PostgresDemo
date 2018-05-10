@@ -56,7 +56,8 @@ BEGIN
         cartname    varchar (50),
         session_ts  timestamptz,
         products    integer[], 
-        units       integer[]
+        units       integer[],
+        expired     boolean default false
     );-- NOTA:  SI HEMOS DE COMPROBAR LA SUMA DE VALORES DEL VECTOR UNITS:
     -- SELECT sum(u) AS total FROM (SELECT unnest(units) AS u FROM client_saved_carts) as a;
     return 1;
@@ -273,8 +274,9 @@ declare timeinterval2 varchar;
 declare edate timestamp;
 declare result float;
 BEGIN    
-    WHILE csales <= numSales LOOP        
-        timeinterval1 := random()*delay || ' seconds';
+    WHILE csales <= numSales LOOP    
+        
+        timeinterval1 := ( (random()*delay)::int)::text || ' seconds';
         clientaleat := 1 + random() * (numClients-1);  
               
         bdate := bdate + timeinterval1::interval; 
