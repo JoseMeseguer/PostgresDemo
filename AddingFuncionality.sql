@@ -102,6 +102,75 @@ EXECUTE PROCEDURE refreshview();
 --DROP TRIGGER trg_check_stock ON stock;  --borramos el trigger
 
 
+-- TRIGGER MAS FUNCION ASOCIADA PARA LA TABLA DE DETALLES DE VENTAS
+-- CONTROLA LAS OPERACIONES DE ESCRITURA PARA SINCRONIZAR EL ESTADO DE LA TABLA DE STOCK
+
+-- ORDEN DE COMPROBACION: PRIMERO DEBE ESTAR INSERTADO, SE QUITAN LAS UNIDADES RESERVADAS SIEMPRE QUE NO SEAN INFERIORES A LAS UNIDADES A RESTAR
+-- DESPUES SE PODRA BORRAR DONDE SE DEVUELVEN LAS UNIDADES DIRECTAMENTE A UNITS YA QUE DESAPARECIERON DE LAS RESERVADAS AL INSERTAR
+-- O BIEN MODIFICAR DONDE LAS CANTIDADES DEBERIAN SALIR DIRECTAMENTE DE UNITS YA QUE NO HAY NADA RESERVADO 
+-- ESTAS 2 ULTIMAS ACCIONES NO SON LAS USUALES DE NEGOCIO, IMPLICA QUE ALGUIEN CON PERMISOS LAS REALICE MANUALMENTE
+-- PERO AUN ASI DEBERIAN VERIFICARSE
+CREATE OR REPLACE FUNCTION fn_update_stock() RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') 
+            THEN 
+                --RAISE NOTICE 'quitando unidades reservadas';
+                update stock set uncheck_units= uncheck_units - NEW.units 
+                where prod= NEW.productid and (uncheck_units - NEW.units) >=0;
+                IF NOT FOUND
+                THEN    RAISE EXCEPTION 'product % not found, or no units enough', NEW.productid;
+                END IF;
+        ELSIF (TG_OP = 'DELETE')   -- se quitan unidades directamente de units si es posible
+            THEN 
+            --RAISE NOTICE 'retornando unidades eliminadas';
+            update stock set units = units + OLD.units  where prod= OLD.productid;
+            IF NOT FOUND 
+                THEN RAISE EXCEPTION 'product % not found', NEW.productid;
+            END IF;
+        ELSIF (TG_OP = 'UPDATE') --la actualizacion puede añadir o quitar unidades
+            THEN 
+                    IF ( NEW.units > OLD.units )  -- si han modificado para pedir mas producto se descuentan de units si es posible
+                        THEN 
+                            --RAISE NOTICE 'tomando nuevas unidades';
+                            update stock set units= units - (NEW.units - OLD.units)
+                            where prod= OLD.productid and units - (NEW.units - OLD.units) >=0;
+                            IF NOT FOUND 
+                            THEN RAISE EXCEPTION 'product % not found, or no units enough', OLD.productid;
+                            END IF; 
+                        ELSIF ( NEW.units < OLD.units ) -- si se toman menos unidades se devuelven directamente a units teniendo en cuenta el signo de diff
+                                THEN 
+                                --RAISE NOTICE 'retornando unidades devueltas';
+                                update stock set units= units + (OLD.units - NEW.units) where prod=OLD.productid;
+                                IF NOT FOUND 
+                                THEN RAISE EXCEPTION 'product % not found', OLD.productid;
+                                END IF; 
+                    END IF; 
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+--DROP TRIGGER trg_idupdate_stock ON saledetails
+CREATE TRIGGER trg_idupdate_stock AFTER INSERT OR DELETE  ON saledetails
+FOR EACH ROW EXECUTE PROCEDURE fn_update_stock();
+
+-- AFINAMOS AL MAXIMO EL CONTROL DEL DISPARO DEL TRIGGER 
+--DROP TRIGGER trg_update_stock ON saledetails
+CREATE TRIGGER trg_update_stock AFTER UPDATE OF units ON saledetails
+FOR EACH ROW WHEN (NEW.units IS DISTINCT FROM OLD.units)  
+EXECUTE PROCEDURE fn_update_stock();
+
+-- COMPROBACIONES
+insert into stock values (15, 3, 3);
+select * from stock where prod = 15;
+insert into saledetails values(10000000, 15, null, 2, 0)
+insert into saledetails values(10000001, 15, null, 2, 0)
+update saledetails set units = 1 where saleid =10000000 and productid = 15
+update saledetails set units = 3 where saleid =10000000 and productid = 15
+select * from saledetails where saleid =10000000 and productid = 15
+delete from saledetails where saleid =10000000 and productid = 15
+
+
 
 -- CREAREMOS PROCEDIMIENTOS SOBRE LOS QUE EL USUARIO USERPRIV TENGA PERMISOS DE EJECUCION 
 -- procedimiento que crea la tabla temporal para guardar el carrito de compra
@@ -120,25 +189,79 @@ BEGIN
     										units integer,
                                             unitprice float );';
     execute myquery;  
+    
     myquery := 'CREATE TRIGGER trg_check_stock AFTER UPDATE OR INSERT OR DELETE ON current_cart_' || codeuser || 
                 ' FOR EACH ROW EXECUTE PROCEDURE cart_reserve_units();';
+	execute myquery;  
+     --CONTROL DEL TRUNCATE MANUAL
+	myquery := 'CREATE TRIGGER trg_TRUNC_current_cart BEFORE TRUNCATE ON current_cart_' || codeuser ||
+				' FOR EACH STATEMENT EXECUTE PROCEDURE fn_trunc_current_cart(); '           
     execute myquery;  
 END; 
 $$ LANGUAGE plpgsql;
 
--- PROTOTIPO DE LA FUNCION SIGUIENDO UN PATRON SIMILAR A LA FUNCION DESARROLLADA
--- PARA EL TRIGGER DE LA TABLA DE DETALLES
+--FUNCION PARA LA GESTION DEL TRUNCADO DE LOS DATOS Y DEVOLVER LAS UNIDADES AL STOCK
+CREATE OR REPLACE FUNCTION fn_trunc_current_cart()  RETURNS TRIGGER  AS $$
+declare cur_cart REFCURSOR; --cuando se abre el cursor dinamicamente es de tipo refcursor
+-- el uso de variables de tipo REFCURSOR es incompatible con bucles FOR por lo que pasamos al clasico WHILE
+declare registro RECORD;
+BEGIN
+    --RAISE NOTICE 'select * from %', TG_TABLE_NAME;
+	OPEN cur_cart FOR EXECUTE format ('select * from %s', TG_TABLE_NAME);
+    FETCH cur_cart INTO registro;
+    WHILE (FOUND) LOOP
+		--raise notice 'product%  units%', registro.product, registro.units;
+		UPDATE stock SET uncheck_units = uncheck_units - registro.units, units = units + registro.units
+				WHERE prod = registro.product;
+		FETCH cur_cart INTO registro;
+    END LOOP;   --salimos del cursor con los valores a insertar cargados en la consulta
+    CLOSE cur_cart;
+    RETURN NULL;
+END;
+$$  LANGUAGE plpgsql;
+
+-- FUNCION SIMILAR A LA DESARROLLADA PARA EL TRIGGER DE LA TABLA DE DETALLES
 CREATE OR REPLACE FUNCTION cart_reserve_units()  RETURNS TRIGGER AS $$
 BEGIN
-	RETURN NULL;
+    IF (TG_OP = 'INSERT') 
+            THEN 
+                update stock set uncheck_units= uncheck_units + NEW.units, units =  units - NEW.units 
+                where prod= NEW.product and (units - NEW.units) >=0;
+                IF NOT FOUND
+                THEN    RAISE EXCEPTION 'product % not found, or no units enough', NEW.product;
+                END IF;
+        ELSIF (TG_OP = 'DELETE')   -- se quitan unidades directamente de units si es posible
+            THEN 
+            update stock set units = units + OLD.units, uncheck_units= uncheck_units - OLD.units  where prod= OLD.product;
+            IF NOT FOUND 
+                THEN RAISE EXCEPTION 'product % not found', NEW.product;
+            END IF;
+        ELSIF (TG_OP = 'UPDATE') --la actualizacion puede añadir o quitar unidades
+            THEN 
+                    IF ( NEW.units > OLD.units )  -- si han modificado para pedir mas producto se descuentan de units si es posible
+                        THEN 
+                            update stock set units= units - (NEW.units - OLD.units), uncheck_units= uncheck_units + (NEW.units - OLD.units)
+                            where prod= OLD.product and units - (NEW.units - OLD.units) >=0;
+                            IF NOT FOUND 
+                            THEN RAISE EXCEPTION 'product % not found, or no units enough', OLD.product;
+                            END IF; 
+                        ELSIF ( NEW.units < OLD.units ) -- si se toman menos unidades se devuelven directamente a units teniendo en cuenta el signo de diff
+                                THEN 
+                                update stock set units= units + (OLD.units - NEW.units), uncheck_units= uncheck_units - (OLD.units - NEW.units)
+                                where prod=OLD.product;
+                                IF NOT FOUND 
+                                THEN RAISE EXCEPTION 'product % not found', OLD.product;
+                                END IF; 
+                    END IF; 
+    END IF;
+    RETURN NULL;
 END; 
 $$ LANGUAGE plpgsql;
 
 -- PRUEBAS
-drop table current_cart_2000
+--drop table current_cart_2000
 select prepareCart(2000); -- ejecutamos el procedimiento para crear una tabla temporal current_cart_2000
 select * from current_cart_2000;  -- comprobamos directamente antes de realizar una vista especifica
-Select addtocart (2000, 5, 3);
 
 -- NECESITAMOS PROCEDIENTOS PARAMETRIZABLES PARA EL CRUD SOBRE LA TABLA TEMPORAL ESPECIFICA DEL USUARIO
 -- (algun procedimiento contendra acciones logicas de verificacion que en sistemas con alta demanda habria que 
@@ -262,33 +385,69 @@ BEGIN
      LOOP
             FETCH cur_cart INTO registro;
 			EXIT WHEN NOT FOUND;
-			raise notice 'product%  units%', registro.product, registro.units;
+			--raise notice 'product%  units%', registro.product, registro.units;
 			totalprice := totalprice + (registro.units * registro.unitprice);
             lines[i] :='($1,'||registro.product||','''||(registro.productname)||''','||registro.units||','||registro.unitprice||')';
             i := i +1;
     END LOOP;   --salimos del cursor con los valores a insertar cargados en la consulta
-	
+	CLOSE cur_cart;
     -- primero insertamos la venta recogiendo el codigo de venta
     insert into sales values (default, current_timestamp, null, totalprice, codeuser) RETURNING id INTO codesale;
     
     -- preramos la consulta de insercion de la lista de prodcutos vendido y la insertamos
     select array_to_string (lines, ',') into details;
-	RAISE notice 'details =  %', details;
+	--RAISE notice 'details =  %', details;
     myquery := 'insert into saledetails values ' || details;  
-	RAISE notice 'query =  %', myquery;
+	--RAISE notice 'query =  %', myquery;
 	EXECUTE format(myquery) USING codesale ;
     RETURN i-1;
 END; 
 $$  LANGUAGE plpgsql;
 
--- PROTOTIPO: procedimiento para descartar el carrito actual
-CREATE OR REPLACE FUNCTION discardCart(codeuser int)  RETURNS int  AS $$
+-- Procedimiento para descartar el carrito actual
+CREATE OR REPLACE FUNCTION discardCart_loop(codeuser int)  RETURNS int  AS $$
+declare cur_cart REFCURSOR; --cuando se abre el cursor dinamicamente es de tipo refcursor
+-- el uso de variables de tipo REFCURSOR es incompatible con bucles FOR por lo que pasamos a LOOP
+declare registro RECORD;
+declare i integer:=0;
 BEGIN
-    -- cursor que recorra la tabla temporal y realice inserciones en sale y saledetails
+    OPEN cur_cart FOR EXECUTE format ('select * from current_cart_%s', codeuser);
+	-- cursor que recorra la tabla temporal y realice inserciones en sale y saledetails
+     LOOP
+            FETCH cur_cart INTO registro;
+			EXIT WHEN NOT FOUND;
+			raise notice 'product%  units%', registro.product, registro.units;
+			UPDATE stock SET uncheck_units = uncheck_units - registro.units, units = units + registro.units
+			WHERE prod = registro.product;
+			i:=i+1;
+    END LOOP;   --salimos del cursor con los valores a insertar cargados en la consulta
+    CLOSE cur_cart;
+    execute format ('TRUNCATE current_cart_%s', codeuser);
+    RETURN i;
+END;
+$$  LANGUAGE plpgsql;
 
-
-    RETURN 0;
-END; 
+-- Procedimiento para descartar el carrito actual
+CREATE OR REPLACE FUNCTION discardCart(codeuser int)  RETURNS int  AS $$
+declare cur_cart REFCURSOR; --cuando se abre el cursor dinamicamente es de tipo refcursor
+-- el uso de variables de tipo REFCURSOR es incompatible con bucles FOR por lo que pasamos al clasico WHILE
+declare registro RECORD;
+declare i integer:=0;
+BEGIN
+    OPEN cur_cart FOR EXECUTE format ('select * from current_cart_%s', codeuser);
+	-- cursor que recorra la tabla temporal y realice inserciones en sale y saledetails
+    FETCH cur_cart INTO registro;
+    WHILE (FOUND) LOOP
+			raise notice 'product%  units%', registro.product, registro.units;
+			UPDATE stock SET uncheck_units = uncheck_units - registro.units, units = units + registro.units
+			WHERE prod = registro.product;
+			i:=i+1;
+			FETCH cur_cart INTO registro;
+    END LOOP;   --salimos del cursor con los valores a insertar cargados en la consulta
+    CLOSE cur_cart;
+    execute format ('TRUNCATE current_cart_%s', codeuser);
+    RETURN i;
+END;
 $$  LANGUAGE plpgsql;
 
 -- una posible funcion a llamar cada X minutos para que eliminara todos los carritos guardados
@@ -303,71 +462,3 @@ END;
 $$  LANGUAGE plpgsql;
 
 
--- PARA TERMINAR
--- TRIGGER MAS FUNCION ASOCIADA PARA LA TABLA DE DETALLES DE VENTAS
--- CONTROLA LAS OPERACIONES DE ESCRITURA PARA SINCRONIZAR EL ESTADO DE LA TABLA DE STOCK
-
--- ORDEN DE COMPROBACION: PRIMERO DEBE ESTAR INSERTADO, SE QUITAN LAS UNIDADES RESERVADAS SIEMPRE QUE NO SEAN INFERIORES A LAS UNIDADES A RESTAR
--- DESPUES SE PODRA BORRAR DONDE SE DEVUELVEN LAS UNIDADES DIRECTAMENTE A UNITS YA QUE DESAPARECIERON DE LAS RESERVADAS AL INSERTAR
--- O BIEN MODIFICAR DONDE LAS CANTIDADES DEBERIAN SALIR DIRECTAMENTE DE UNITS YA QUE NO HAY NADA RESERVADO 
--- ESTAS 2 ULTIMAS ACCIONES NO SON LAS USUALES DE NEGOCIO, IMPLICA QUE ALGUIEN CON PERMISOS LAS REALICE MANUALMENTE
--- PERO AUN ASI DEBERIAN VERIFICARSE
-CREATE OR REPLACE FUNCTION fn_update_stock() RETURNS TRIGGER AS $$
-BEGIN
-    IF (TG_OP = 'INSERT') 
-            THEN 
-                --RAISE NOTICE 'quitando unidades reservadas';
-                update stock set uncheck_units= uncheck_units - NEW.units 
-                where prod= NEW.productid and (uncheck_units - NEW.units) >=0;
-                IF NOT FOUND
-                THEN    RAISE EXCEPTION 'product % not found, or no units enough', NEW.productid;
-                END IF;
-        ELSIF (TG_OP = 'DELETE')   -- se quitan unidades directamente de units si es posible
-            THEN 
-            --RAISE NOTICE 'retornando unidades eliminadas';
-            update stock set units = units + OLD.units  where prod= OLD.productid;
-            IF NOT FOUND 
-                THEN RAISE EXCEPTION 'product % not found', NEW.productid;
-            END IF;
-        ELSIF (TG_OP = 'UPDATE') --la actualizacion puede añadir o quitar unidades
-            THEN 
-                    IF ( NEW.units > OLD.units )  -- si han modificado para pedir mas producto se descuentan de units si es posible
-                        THEN 
-                            --RAISE NOTICE 'tomando nuevas unidades';
-                            update stock set units= units - (NEW.units - OLD.units)
-                            where prod= OLD.productid and units - (NEW.units - OLD.units) >=0;
-                            IF NOT FOUND 
-                            THEN RAISE EXCEPTION 'product % not found, or no units enough', OLD.productid;
-                            END IF; 
-                        ELSIF ( NEW.units < OLD.units ) -- si se toman menos unidades se devuelven directamente a units teniendo en cuenta el signo de diff
-                                THEN 
-                                --RAISE NOTICE 'retornando unidades devueltas';
-                                update stock set units= units + (OLD.units - NEW.units) where prod=OLD.productid;
-                                IF NOT FOUND 
-                                THEN RAISE EXCEPTION 'product % not found', OLD.productid;
-                                END IF; 
-                    END IF; 
-    END IF;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
---DROP TRIGGER trg_idupdate_stock ON saledetails
-CREATE TRIGGER trg_idupdate_stock AFTER INSERT OR DELETE  ON saledetails
-FOR EACH ROW EXECUTE PROCEDURE fn_update_stock();
-
--- AFINAMOS AL MAXIMO EL CONTROL DEL DISPARO DEL TRIGGER 
---DROP TRIGGER trg_update_stock ON saledetails
-CREATE TRIGGER trg_update_stock AFTER UPDATE OF units ON saledetails
-FOR EACH ROW WHEN (NEW.units IS DISTINCT FROM OLD.units)  
-EXECUTE PROCEDURE fn_update_stock();
-
--- COMPROBACIONES
-insert into stock values (15, 3, 3);
-select * from stock where prod = 15;
-insert into saledetails values(10000000, 15, null, 2, 0)
-insert into saledetails values(10000001, 15, null, 2, 0)
-update saledetails set units = 1 where saleid =10000000 and productid = 15
-update saledetails set units = 3 where saleid =10000000 and productid = 15
-select * from saledetails where saleid =10000000 and productid = 15
-delete from saledetails where saleid =10000000 and productid = 15
