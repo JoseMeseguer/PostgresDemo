@@ -19,7 +19,7 @@ select  prepareDb(1, 1000, 1000, 10000);  -- basic load with default indexes and
 
 
 -- fill the tables with a minim load (clients, products, opers)
-select  loadData(  1000,   10000,   10000);  
+select  loadData(  10000,   100000,   1000000);  
 --medium load
 select  loadData( 100000,  1000000,  10000000);  
 --massive load
